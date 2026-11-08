@@ -15,21 +15,83 @@ Tabs:
 The GUI uses the project's compressor package. History and performance
 measurements shown here are for the current GUI session; this GUI does not
 claim persistent history or background benchmarking.
+
+The Compress File tab also offers batch compression of several files at
+once (US-10), and warns when a compressed file would not be smaller than
+the original (use-case flow A2).
 """
 
 import os
+import sys
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+
+def _find_compressor_package():
+    """Find the folder that contains the project's `compressor` package.
+
+    This file works wherever it is saved: next to the package, or in a
+    folder that contains the project folder (for example
+    Downloads\\GITHUB\\file-compression-tool-main).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [here]
+    try:
+        for name in os.listdir(here):
+            path = os.path.join(here, name)
+            if os.path.isdir(path):
+                candidates.append(path)
+    except OSError:
+        pass
+    parent = here
+    for _ in range(3):
+        parent = os.path.dirname(parent)
+        if parent:
+            candidates.append(parent)
+    for folder in candidates:
+        if os.path.isdir(os.path.join(folder, "compressor")):
+            return folder
+    return None
+
+
+_PKG_DIR = _find_compressor_package()
+if _PKG_DIR is None:
+    print(
+        "ERROR: could not find the 'compressor' folder.\n"
+        "Save this file in the project folder, next to main.py "
+        "(the folder that contains the 'compressor' folder), "
+        "then run it again.",
+        file=sys.stderr,
+    )
+    _root = tk.Tk()
+    _root.withdraw()
+    messagebox.showerror(
+        "compressor package not found",
+        "This file needs the project's 'compressor' folder next to it.\n\n"
+        "Save gui.py in the project folder, next to main.py\n"
+        "(the folder that contains the 'compressor' folder),\n"
+        "then run it again.",
+    )
+    sys.exit(1)
+sys.path.insert(0, _PKG_DIR)
+
+from compressor.batch_compression import compress_files
+from compressor.errors import (
+    CompressionError,
+    CorruptedFileError,
+    FileValidationError,
+    OutputExistsError,
+)
 from compressor.frequency import calculate_frequencies
 from compressor.huffman_tree import build_huffman_tree
 from compressor.huffman_codes import generate_huffman_codes
-from compressor.file_format import build_compressed_bytes
+from compressor.file_format import MAX_FILE_SIZE, build_compressed_bytes
 from compressor.decompressor import decompress_bytes
 from compressor.tree_visualizer import render_tree
 from compressor.huffman_code_table import build_huffman_code_table
 from compressor.compression_stats import calculate_statistics, format_statistics
+from compressor.utils import format_size
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +331,111 @@ class FileCompressionGUI:
             return file.read()
 
     @staticmethod
-    def _write_new_file(path, data):
-        """Create a new output without replacing an existing file."""
-        with open(path, "xb") as file:
+    def _friendly_error(error):
+        """Turn an exception into a short message a user can act on.
+
+        The project's own errors already carry plain messages, so they are
+        shown as they are. Anything unexpected becomes one plain sentence
+        instead of raw technical text (SR-8).
+        """
+        if isinstance(error, CompressionError):
+            return str(error)
+        if isinstance(error, FileNotFoundError):
+            return "The file was not found."
+        if isinstance(error, PermissionError):
+            return "No permission to read or write that file."
+        if isinstance(error, OSError):
+            if error.errno == 28:  # No space left on device
+                return "There is not enough free space to save the file."
+            return ("The file could not be read or written. Check the file "
+                    "and the folder, then try again.")
+        return ("Something went wrong and the operation was stopped. "
+                "No files were changed.")
+
+    def _input_size_ok(self, path):
+        """True when `path` is within the supported size limit (SR-6).
+
+        Checked before the file is read, so an oversized file is refused
+        without being loaded into memory first.
+        """
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            messagebox.showerror(
+                "Invalid file", "The selected file cannot be read."
+            )
+            return False
+        if size > MAX_FILE_SIZE:
+            messagebox.showerror(
+                "File too large",
+                f"This file is {format_size(size)}.\n"
+                f"Files larger than {format_size(MAX_FILE_SIZE)} "
+                "are not supported.",
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _format_stats_lines(stats):
+        """Render the statistics dict from format_statistics as clean,
+        aligned lines instead of a raw dict dump."""
+        return "\n".join(
+            f"{key:<24}: {value}" for key, value in stats.items()
+        )
+
+    @staticmethod
+    def _write_new_file(path, data, overwrite=False):
+        """Write an output file. Without overwrite, an existing file is
+        never replaced (exclusive creation raises FileExistsError)."""
+        mode = "wb" if overwrite else "xb"
+        with open(path, mode) as file:
             file.write(data)
+
+    def _write_with_overwrite_prompt(self, path, data, what="output",
+                                     save_dialog=None):
+        """Write `data` to `path`, asking before replacing an existing file.
+
+        If the save fails (for example the disk is full), and `save_dialog`
+        is given, the user is offered another location and the write is
+        retried there (use-case flow A3).
+
+        Returns (written, final_path): `written` is True when the file was
+        written, and `final_path` is where it ended up.
+        """
+        current = path
+        overwrite = False
+        while True:
+            try:
+                self._write_new_file(current, data, overwrite=overwrite)
+                return True, current
+            except FileExistsError:
+                if messagebox.askyesno(
+                    "Output already exists",
+                    f"'{os.path.basename(current)}' already exists.\n\n"
+                    f"Overwrite it? (The existing {what} will be replaced.)",
+                ):
+                    overwrite = True
+                    continue
+                self.status.set(
+                    f"Stopped — the existing {what} was not changed."
+                )
+                return False, None
+            except OSError as error:
+                if save_dialog is None:
+                    raise
+                if not messagebox.askyesno(
+                    "Could not save the file",
+                    f"{self._friendly_error(error)}\n\n"
+                    "Choose another location?",
+                ):
+                    self.status.set("Save cancelled.")
+                    return False, None
+                new_path = save_dialog()
+                if not new_path:
+                    self.status.set("Save cancelled.")
+                    return False, None
+                current = new_path
+                overwrite = False
 
     def _record_history(self, operation, source, output, input_size,
                         output_size, elapsed=None):
@@ -319,12 +482,30 @@ class FileCompressionGUI:
             picker, "Browse files", self.choose_compress_file, secondary=True
         ).pack(side="left")
 
+        # Shown right under the file box, so it is visible however the
+        # path got in there (Browse button, or typed/pasted by hand).
+        self.selected_info = tk.Label(
+            self.compress_tab,
+            text="No file selected yet.",
+            bg=COLORS["surface"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.selected_info.pack(fill="x", padx=23, pady=(0, 2))
+        self.compress_path.trace_add("write", self._on_compress_path_changed)
+
         actions = tk.Frame(self.compress_tab, bg=COLORS["surface"])
         actions.pack(fill="x", padx=23, pady=(4, 16))
 
         self._button(
             actions, "Compress Selected File", self.compress_file
         ).pack(side="left")
+
+        self._button(
+            actions, "Compress Multiple Files", self.compress_multiple_files,
+            secondary=True
+        ).pack(side="left", padx=(9, 0))
 
         tk.Label(
             actions,
@@ -345,11 +526,27 @@ class FileCompressionGUI:
             "The compression result and statistics will appear here.",
         )
 
+    def _on_compress_path_changed(self, *_args):
+        """Show the selected file's name and size however the path was
+        entered (Browse button, or typed/pasted into the box)."""
+        path = self.compress_path.get().strip()
+        if not path:
+            self.selected_info.configure(text="No file selected yet.")
+            return
+        if os.path.isfile(path):
+            info = (
+                f"Selected: {os.path.basename(path)} "
+                f"({format_size(os.path.getsize(path))})"
+            )
+        else:
+            info = f"Selected: {os.path.basename(path)} (file not found)"
+        self.selected_info.configure(text=info)
+        self.status.set(info)
+
     def choose_compress_file(self):
         path = filedialog.askopenfilename(title="Choose a file to compress")
         if path:
             self.compress_path.set(path)
-            self.status.set(f"Selected: {os.path.basename(path)}")
 
     def compress_file(self):
         source = self.compress_path.get().strip()
@@ -359,6 +556,8 @@ class FileCompressionGUI:
             return
         if not os.path.isfile(source):
             messagebox.showerror("Invalid file", "The selected file does not exist.")
+            return
+        if not self._input_size_ok(source):
             return
 
         output = filedialog.asksaveasfilename(
@@ -393,10 +592,40 @@ class FileCompressionGUI:
             compressed = build_compressed_bytes(data, frequencies, codes)
             elapsed = time.perf_counter() - start
 
-            self._write_new_file(output, compressed)
+            # Use-case flow A2: warn when compression does not shrink the
+            # file, and let the user keep it or cancel before anything is
+            # written.
+            kept_anyway = False
+            if len(compressed) >= len(data):
+                if not messagebox.askyesno(
+                    "No size reduction",
+                    f"The compressed file ({format_size(len(compressed))}) "
+                    f"is not smaller than the original "
+                    f"({format_size(len(data))}).\n\n"
+                    "Keep the compressed file anyway?",
+                ):
+                    self.status.set(
+                        "Compression cancelled — no size reduction achieved."
+                    )
+                    return
+                kept_anyway = True
+
+            written, output = self._write_with_overwrite_prompt(
+                output,
+                compressed,
+                save_dialog=lambda: filedialog.asksaveasfilename(
+                    title="Save compressed file",
+                    initialfile=os.path.basename(source) + ".hfc",
+                    defaultextension=".hfc",
+                    filetypes=[("Huffman compressed files", "*.hfc"),
+                               ("All files", "*.*")],
+                ),
+            )
+            if not written:
+                return
 
             stats = calculate_statistics(len(data), len(compressed))
-            stats_text = format_statistics(stats)
+            stats_text = self._format_stats_lines(format_statistics(stats))
             self._set_text(
                 self.compress_output,
                 "COMPRESSION SUCCESSFUL\n"
@@ -408,8 +637,15 @@ class FileCompressionGUI:
                 f"Elapsed time    : {elapsed:.6f} seconds\n\n"
                 "COMPRESSION STATISTICS\n"
                 "────────────────────────────────────────────\n"
-                f"{stats_text}\n\n"
-                "The original file was not modified.",
+                f"{stats_text}\n"
+                "Compression ratio (compressed ÷ original): "
+                f"{len(compressed) / len(data):.2f}\n\n"
+                + (
+                    "Note: the compressed file is not smaller than the "
+                    "original — kept at your choice.\n\n"
+                    if kept_anyway else ""
+                )
+                + "The original file was not modified.",
             )
 
             self.last_performance = {
@@ -433,9 +669,142 @@ class FileCompressionGUI:
             self.status.set("Compression stopped — output already exists.")
         except Exception as error:
             messagebox.showerror(
-                "Compression failed", f"The file could not be compressed.\n\n{error}"
+                "Compression failed", self._friendly_error(error)
             )
             self.status.set("Compression failed.")
+
+    def compress_multiple_files(self):
+        """Batch compression (US-10): compress several files at once."""
+        paths = filedialog.askopenfilenames(title="Choose files to compress")
+        if not paths:
+            return
+
+        output_dir = filedialog.askdirectory(
+            title="Choose the folder for the .hfc files"
+        )
+        if not output_dir:
+            self.status.set("Batch compression cancelled.")
+            return
+
+        for path in paths:
+            if not self._input_size_ok(path):
+                return
+
+        self.status.set(f"Compressing {len(paths)} files...")
+        self.root.update_idletasks()
+
+        try:
+            start = time.perf_counter()
+            results = compress_files(paths, output_dir=output_dir)
+            elapsed = time.perf_counter() - start
+        except OutputExistsError as error:
+            if messagebox.askyesno(
+                "Output already exists",
+                f"{error}\n\nOverwrite the existing output files?",
+            ):
+                try:
+                    start = time.perf_counter()
+                    results = compress_files(
+                        paths, output_dir=output_dir, overwrite=True
+                    )
+                    elapsed = time.perf_counter() - start
+                except Exception as error:
+                    messagebox.showerror(
+                        "Batch compression failed",
+                        self._friendly_error(error),
+                    )
+                    self.status.set("Batch compression failed.")
+                    return
+            else:
+                self.status.set(
+                    "Batch compression stopped — existing files were not changed."
+                )
+                return
+        except (ValueError, CompressionError) as error:
+            messagebox.showerror(
+                "Batch compression failed", self._friendly_error(error)
+            )
+            self.status.set("Batch compression failed.")
+            return
+        except OSError as error:
+            # Use-case flow A3: a failed save offers another location.
+            if not messagebox.askyesno(
+                "Could not save the files",
+                f"{self._friendly_error(error)}\n\n"
+                "Choose another folder and try again?",
+            ):
+                self.status.set("Batch compression cancelled.")
+                return
+            new_dir = filedialog.askdirectory(
+                title="Choose another folder for the .hfc files"
+            )
+            if not new_dir:
+                self.status.set("Batch compression cancelled.")
+                return
+            try:
+                start = time.perf_counter()
+                results = compress_files(paths, output_dir=new_dir)
+                elapsed = time.perf_counter() - start
+            except Exception as error:
+                messagebox.showerror(
+                    "Batch compression failed", self._friendly_error(error)
+                )
+                self.status.set("Batch compression failed.")
+                return
+        except Exception as error:
+            messagebox.showerror(
+                "Batch compression failed", self._friendly_error(error)
+            )
+            self.status.set("Batch compression failed.")
+            return
+
+        total_in = sum(item["original_size"] for item in results)
+        total_out = sum(item["compressed_size"] for item in results)
+        lines = [
+            "BATCH COMPRESSION SUCCESSFUL",
+            "════════════════════════════════════════════",
+            "",
+            f"Files compressed: {len(results)}",
+            f"Total original size:   {total_in:,} bytes",
+            f"Total compressed size: {total_out:,} bytes",
+            f"Elapsed time: {elapsed:.6f} seconds",
+            "",
+            "FILES",
+            "────────────────────────────────────────────",
+        ]
+        for item in results:
+            saved = item["original_size"] - item["compressed_size"]
+            lines.append(
+                f"{os.path.basename(item['input_path'])}: "
+                f"{item['original_size']:,} → {item['compressed_size']:,} bytes "
+                f"({saved:+,} bytes)"
+            )
+        lines.append("")
+        lines.append(f"Outputs saved in: {output_dir}")
+        lines.append("The original files were not modified.")
+        self._set_text(self.compress_output, "\n".join(lines))
+
+        self.last_performance = {
+            "operation": "Batch compression",
+            "source": f"{len(results)} files",
+            "input_size": total_in,
+            "output_size": total_out,
+            "elapsed": elapsed,
+        }
+        for item in results:
+            self._record_history(
+                "Compression",
+                item["input_path"],
+                item["output_path"],
+                item["original_size"],
+                item["compressed_size"],
+                elapsed,
+            )
+        self.status.set(f"Batch compression completed: {len(results)} files.")
+        messagebox.showinfo(
+            "Batch compression complete",
+            f"{len(results)} file(s) compressed.",
+        )
 
     # ------------------------------------------------------------------
     # Tab 2 — Decompress File
@@ -474,13 +843,19 @@ class FileCompressionGUI:
         )
         if not source:
             return
+        if not self._input_size_ok(source):
+            return
 
-        output = filedialog.asksaveasfilename(
-            title="Save restored file",
-            initialfile=os.path.basename(source)[:-4] if source.lower().endswith(".hfc")
-            else os.path.basename(source) + "_restored",
-            filetypes=[("All files", "*.*")],
-        )
+        def ask_output():
+            return filedialog.asksaveasfilename(
+                title="Save restored file",
+                initialfile=os.path.basename(source)[:-4]
+                if source.lower().endswith(".hfc")
+                else os.path.basename(source) + "_restored",
+                filetypes=[("All files", "*.*")],
+            )
+
+        output = ask_output()
         if not output:
             self.status.set("Decompression cancelled.")
             return
@@ -501,8 +876,12 @@ class FileCompressionGUI:
             restored = decompress_bytes(raw)
             elapsed = time.perf_counter() - start
 
-            # Exclusive creation protects an existing destination.
-            self._write_new_file(output, restored)
+            written, output = self._write_with_overwrite_prompt(
+                output, restored, what="restored file",
+                save_dialog=ask_output,
+            )
+            if not written:
+                return
 
             self._set_text(
                 self.decompress_output,
@@ -513,8 +892,10 @@ class FileCompressionGUI:
                 f"Compressed size : {len(raw):,} bytes\n"
                 f"Restored size   : {len(restored):,} bytes\n"
                 f"Elapsed time    : {elapsed:.6f} seconds\n\n"
-                "The decoder completed without reporting a format or "
-                "integrity error.",
+                "LOSSLESS VERIFICATION: PASSED\n"
+                "The decoder verified the CRC32 checksum stored in the "
+                "compressed file, so the restored data is byte-for-byte "
+                "identical to the original.",
             )
 
             self.last_performance = {
@@ -541,7 +922,7 @@ class FileCompressionGUI:
         except Exception as error:
             messagebox.showerror(
                 "Decompression failed",
-                f"The file could not be decompressed.\n\n{error}",
+                self._friendly_error(error),
             )
             self.status.set("Decompression failed — file may be invalid or corrupted.")
 
@@ -581,6 +962,8 @@ class FileCompressionGUI:
     def explore_file(self):
         source = filedialog.askopenfilename(title="Choose a file to analyse")
         if not source:
+            return
+        if not self._input_size_ok(source):
             return
 
         try:
@@ -624,7 +1007,7 @@ class FileCompressionGUI:
 
         except Exception as error:
             messagebox.showerror(
-                "Analysis failed", f"Could not analyse this file.\n\n{error}"
+                "Analysis failed", self._friendly_error(error)
             )
             self.status.set("Huffman analysis failed.")
 
@@ -674,7 +1057,7 @@ class FileCompressionGUI:
             if elapsed > 0:
                 throughput = item["input_size"] / elapsed
                 output.append(f"Input throughput: {throughput:,.2f} bytes/second")
-            if item["operation"] == "Compression":
+            if item["operation"] in ("Compression", "Batch compression"):
                 stats = calculate_statistics(
                     item["input_size"], item["output_size"]
                 )
@@ -683,7 +1066,9 @@ class FileCompressionGUI:
                         "",
                         "COMPRESSION STATISTICS",
                         "────────────────────────────────────────────",
-                        str(format_statistics(stats)),
+                        self._format_stats_lines(format_statistics(stats)),
+                        "Compression ratio (compressed ÷ original): "
+                        f"{item['output_size'] / item['input_size']:.2f}",
                     ]
                 )
             output.extend(
@@ -778,6 +1163,10 @@ class FileCompressionGUI:
 def main():
     root = tk.Tk()
     FileCompressionGUI(root)
+    # Test hook: FCT_AUTOCLOSE_MS=2000 closes the window after 2 s.
+    auto_close = os.environ.get("FCT_AUTOCLOSE_MS")
+    if auto_close:
+        root.after(int(auto_close), root.destroy)
     root.mainloop()
 
 
