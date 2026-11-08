@@ -81,10 +81,19 @@ def decode_payload(payload, root, original_size, padding):
         raise CorruptedFileError("The frequency table is empty.")
 
     if root.is_leaf():
+        # A file with one distinct byte value has the single code "0", so the
+        # compressor stores one 0-bit per byte (padded to whole bytes).
+        # Older/alternative files with no payload at all are also accepted.
         if payload or padding:
-            raise CorruptedFileError(
-                "Unexpected payload for a single-symbol file."
-            )
+            total_bits = len(payload) * 8 - padding
+            if (
+                total_bits != original_size
+                or any(payload)
+                or len(payload) != (original_size + 7) // 8
+            ):
+                raise CorruptedFileError(
+                    "Unexpected payload for a single-symbol file."
+                )
         return bytes([root.symbol]) * original_size
 
     total_bits = len(payload) * 8 - padding
